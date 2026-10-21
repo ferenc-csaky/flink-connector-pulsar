@@ -21,7 +21,9 @@ package org.apache.flink.connector.pulsar.sink.committer;
 import org.apache.pulsar.client.api.transaction.TxnID;
 import org.junit.jupiter.api.Test;
 
+import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
 import java.util.Arrays;
@@ -43,21 +45,12 @@ class PulsarCommittableSerializerTest {
 
     @Test
     void v2SerializeAndDeserializeWithMessages() throws IOException {
-        TxnID txnID =
-                new TxnID(
-                        ThreadLocalRandom.current().nextLong(),
-                        ThreadLocalRandom.current().nextLong());
-        Map<String, MessageIdPojo> messages = new HashMap<>();
-        messages.put("topic-a", new MessageIdPojo(1L, 2L, 3, 0, -1));
-        messages.put("topic-b", new MessageIdPojo(10L, 20L, 1, 0, -1));
-
-        PulsarCommittable committable = new PulsarCommittable(txnID, messages);
+        PulsarCommittable committable = new PulsarCommittable(randomTxnID(), sampleMessages());
 
         byte[] bytes = INSTANCE.serialize(committable);
         PulsarCommittable committable1 = INSTANCE.deserialize(INSTANCE.getVersion(), bytes);
 
         assertThat(committable1).isEqualTo(committable);
-        assertThat(committable1.getVersion()).isEqualTo(2);
     }
 
     @Test
@@ -74,10 +67,7 @@ class PulsarCommittableSerializerTest {
 
     @Test
     void v1DeserializationIsCompatible() throws IOException {
-        TxnID txnID =
-                new TxnID(
-                        ThreadLocalRandom.current().nextLong(),
-                        ThreadLocalRandom.current().nextLong());
+        TxnID txnID = randomTxnID();
         byte[] serialized;
         try (ByteArrayOutputStream bytes = new ByteArrayOutputStream();
                 DataOutputStream output = new DataOutputStream(bytes)) {
@@ -90,14 +80,24 @@ class PulsarCommittableSerializerTest {
 
         PulsarCommittable committable = INSTANCE.deserialize(1, serialized);
 
-        assertThat(committable.getVersion()).isEqualTo(1);
         assertThat(committable.getTxnID()).isEqualTo(txnID);
         assertThat(committable.getLatestPublishedMessages()).isEmpty();
 
         byte[] v2Serialized = INSTANCE.serialize(committable);
         PulsarCommittable roundTripped = INSTANCE.deserialize(INSTANCE.getVersion(), v2Serialized);
         assertThat(roundTripped).isEqualTo(committable);
-        assertThat(roundTripped.getVersion()).isEqualTo(1);
+    }
+
+    @Test
+    void v2StateIsReadableByV1Deserializer() throws IOException {
+        TxnID txnID = randomTxnID();
+        byte[] serialized = INSTANCE.serialize(new PulsarCommittable(txnID, sampleMessages()));
+
+        // Connector versions that only know V1 ignore the version and read this prefix.
+        try (DataInputStream input = new DataInputStream(new ByteArrayInputStream(serialized))) {
+            assertThat(new TxnID(input.readLong(), input.readLong())).isEqualTo(txnID);
+            assertThat(input.readUTF()).isEmpty();
+        }
     }
 
     @Test
@@ -114,45 +114,13 @@ class PulsarCommittableSerializerTest {
     }
 
     @Test
-    void emptyTopicInV1StateFailsDeserialization() throws IOException {
+    void negativeMessageCountInV2StateFailsDeserialization() throws IOException {
         byte[] serialized;
         try (ByteArrayOutputStream bytes = new ByteArrayOutputStream();
                 DataOutputStream output = new DataOutputStream(bytes)) {
             output.writeLong(1L);
             output.writeLong(2L);
             output.writeUTF("");
-            output.flush();
-            serialized = bytes.toByteArray();
-        }
-
-        assertThatThrownBy(() -> INSTANCE.deserialize(1, serialized))
-                .isInstanceOf(IOException.class)
-                .hasMessageContaining("topic must not be empty");
-    }
-
-    @Test
-    void unsupportedCommittableVersionInV2StateFailsDeserialization() throws IOException {
-        byte[] serialized;
-        try (ByteArrayOutputStream bytes = new ByteArrayOutputStream();
-                DataOutputStream output = new DataOutputStream(bytes)) {
-            output.writeInt(3);
-            output.flush();
-            serialized = bytes.toByteArray();
-        }
-
-        assertThatThrownBy(() -> INSTANCE.deserialize(2, serialized))
-                .isInstanceOf(IOException.class)
-                .hasMessageContaining("Unsupported Pulsar committable state version");
-    }
-
-    @Test
-    void negativeMessageCountInV2StateFailsDeserialization() throws IOException {
-        byte[] serialized;
-        try (ByteArrayOutputStream bytes = new ByteArrayOutputStream();
-                DataOutputStream output = new DataOutputStream(bytes)) {
-            output.writeInt(2);
-            output.writeLong(1L);
-            output.writeLong(2L);
             output.writeInt(-1);
             output.flush();
             serialized = bytes.toByteArray();
@@ -168,9 +136,9 @@ class PulsarCommittableSerializerTest {
         byte[] serialized;
         try (ByteArrayOutputStream bytes = new ByteArrayOutputStream();
                 DataOutputStream output = new DataOutputStream(bytes)) {
-            output.writeInt(2);
             output.writeLong(1L);
             output.writeLong(2L);
+            output.writeUTF("");
             output.writeInt(Integer.MAX_VALUE);
             output.flush();
             serialized = bytes.toByteArray();
@@ -178,14 +146,6 @@ class PulsarCommittableSerializerTest {
 
         assertThatThrownBy(() -> INSTANCE.deserialize(2, serialized))
                 .isInstanceOf(IOException.class);
-    }
-
-    @Test
-    void committableToStringIncludesVersion() {
-        PulsarCommittable committable =
-                new PulsarCommittable(new TxnID(1L, 2L), Collections.emptyMap());
-
-        assertThat(committable.toString()).contains("version=2");
     }
 
     @Test
@@ -198,5 +158,17 @@ class PulsarCommittableSerializerTest {
         assertThatThrownBy(() -> INSTANCE.deserialize(2, serializedWithTrailingByte))
                 .isInstanceOf(IOException.class)
                 .hasMessageContaining("Trailing bytes");
+    }
+
+    private static TxnID randomTxnID() {
+        return new TxnID(
+                ThreadLocalRandom.current().nextLong(), ThreadLocalRandom.current().nextLong());
+    }
+
+    private static Map<String, MessageIdPojo> sampleMessages() {
+        Map<String, MessageIdPojo> messages = new HashMap<>();
+        messages.put("topic-a", new MessageIdPojo(1L, 2L, 3, 0, -1));
+        messages.put("topic-b", new MessageIdPojo(10L, 20L, 1, 0, -1));
+        return messages;
     }
 }
